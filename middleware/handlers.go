@@ -1,19 +1,18 @@
 package middleware
 
 import (
-	
 	"database/sql"
-	"encoding/json"		// package to encode and decode the json into struct and vice versa
+	"encoding/json" // package to encode and decode the json into struct and vice versa
 	"fmt"
-	"go-postgres/models"	// models package where Stock schema is defined
+	"go-postgres/models" // models package where Stock schema is defined
 	"log"
-	"net/http"	// used to access the request and response object of the api
-	"os"		// used to read the environment variable
-	"strconv"	// package used to covert string into int type
+	"net/http" // used to access the request and response object of the api
+	"strconv"  // package used to covert string into int type
 
-	"github.com/gorilla/mux"	// used to get the params from the route
-	"github.com/joho/godotenv"	// package used to read the .env file
-	_ "github.com/lib/pq"      // postgres golang driver
+	"github.com/gorilla/mux" // used to get the params from the route
+	
+
+	"go-postgres/database"
 )
 
 // response format
@@ -22,34 +21,6 @@ type response struct {
 	Message string `json:"message,omitempty"`
 }
 
-// create connection with postgres db
-func createConnection() *sql.DB {
-	err := godotenv.Load(".env")	
-	if err != nil {
-		log.Fatal("Error loading .env file")
-	}
-
-	db, err := sql.Open("postgres", os.Getenv("POSTGRES_URL"))		//os.Getenv("POSTGRES_URL") => fetches the value of the POSTGRES_URL environment variable.
-	//I want to connect to a PostgreSQL database using the Go database/sql package.
-	//_ "github.com/lib/pq"  --> a PostgreSQL driver which registers itself under the name "postgres" when imported.
-	if err != nil {
-		// panic(err)
-		log.Println("Failed to open DB:", err)
-		return nil // or handle properly
-	}
-
-	//sql.Open does not immediately connect to the database! It prepares the connection pool.
-	//You should test the connection with db.Ping():
-	err = db.Ping()		//sql.Open(...) -> Creates a DB connection object, doesn't connect yet
-						//db.Ping() -> Actually tries to connect, useful for validation/debugging
-	if err != nil {
-		fmt.Println("Database Unreachable")
-		panic(err)
-	}
-
-	fmt.Println("Successfully connected to postgres")
-	return db
-}
 
 func CreateStock(w http.ResponseWriter, r *http.Request){
 	var stock models.Stock
@@ -57,10 +28,16 @@ func CreateStock(w http.ResponseWriter, r *http.Request){
 	err :=json.NewDecoder(r.Body).Decode(&stock)  //reads from JSON body (from Postman or frontend) and decodes it into the stock variable
 
 	if err != nil{
-		log.Fatalf("Unable to decide the request body. %v", err)
+		http.Error(w, fmt.Sprintf("Invalid request body: %v", err), http.StatusBadRequest)
+		return
 	}
 
-	insertID := insertStock(stock)
+	insertID, err := insertStock(stock)
+	if err!=nil{
+		log.Printf("Error inserting stock: %v", err)
+		http.Error(w, "Failed to insert stock", http.StatusInternalServerError)
+		return
+	}
 
 	res:=response{
 		ID: insertID,
@@ -72,16 +49,22 @@ func CreateStock(w http.ResponseWriter, r *http.Request){
 
 func GetStock(w http.ResponseWriter, r *http.Request){
 	params:= mux.Vars(r)
-
 	id , err := strconv.Atoi(params["id"])
 
 	if err!= nil{
-		log.Fatalf("Unable to convert the string into int. %v",err)
+		http.Error(w, fmt.Sprintf("ID must be an integer: %v", err), http.StatusBadRequest)
+		return
 	}
-	stock , err:= getStock(int64(id))
 
+	stock , err:= getStock(int64(id))
 	if err!= nil{
-		log.Fatalf("Unable to get stock %v", err)
+		if err == sql.ErrNoRows {
+			http.Error(w, "No stock found", http.StatusNotFound)
+		} else {
+			log.Printf("Error fetching stock: %v", err)
+			http.Error(w, "Error fetching stock", http.StatusInternalServerError)
+		}
+		return
 	}
 
 	json.NewEncoder(w).Encode(stock)
@@ -91,7 +74,9 @@ func GetAllStocks(w http.ResponseWriter, r *http.Request){
 	stocks , err := getAllStocks()
 
 	if err!= nil{
-		log.Fatalf("Unable to get all stocks %v", err)
+		log.Printf("Error fetching all stocks: %v", err)
+		http.Error(w, "Error fetching all stocks", http.StatusInternalServerError)
+		return
 	}
 
 	json.NewEncoder(w).Encode(stocks)
@@ -104,19 +89,30 @@ func UpdateStock(w http.ResponseWriter, r *http.Request){
 	id ,err := strconv.Atoi(params["id"])
 
 	if err!= nil{
-		log.Fatalf("Unable to convert string into int %v", err)
+		http.Error(w, fmt.Sprintf("ID must be an integer: %v", err), http.StatusBadRequest)
+		return
 	}
 
 	var stock models.Stock
 
 	err =json.NewDecoder(r.Body).Decode(&stock) //decode by taking reference as stock
 	if err!= nil{
-		log.Fatalf("Unable to decode the request body %v", err)
+		http.Error(w, fmt.Sprintf("Invalid request body: %v", err), http.StatusBadRequest)
+		return
 	}
 
-	updateRows:= updateStock(int64(id), stock)
+	updatedRows,err:= updateStock(int64(id), stock)
+	if err != nil {
+		log.Printf("Error updating stock: %v", err)
+		http.Error(w, "Failed to update stock", http.StatusInternalServerError)
+		return
+	}
+	if updatedRows == 0 {
+		http.Error(w, "No stock found to update", http.StatusNotFound)
+		return
+	}
 
-	msg:= fmt.Sprintf("Stock updated successfully. Total rows/records affected %v", updateRows)
+	msg:= fmt.Sprintf("Stock updated successfully. Total rows/records affected %v", updatedRows)
 	res:=response{
 		ID :int64(id),
 		Message:msg,
@@ -130,10 +126,16 @@ func DeleteStock(w http.ResponseWriter, r *http.Request){
 	params:= mux.Vars(r)
 	id,err := strconv.Atoi(params["id"])
 	if err != nil{
-		log.Fatalf("Unable to convert string to int %v",err)
+		http.Error(w, fmt.Sprintf("ID must be an integer: %v", err), http.StatusBadRequest)
+		return
 	}
 
-	deletedRows := deleteStock(int64(id))
+	deletedRows,err  := deleteStock(int64(id))
+	if err!=nil{
+		log.Printf("Error deleting stock: %v", err)
+		http.Error(w, "Failed to delete stock", http.StatusInternalServerError)
+		return
+	}
 
 	msg:= fmt.Sprintf("Stock deleted successfully. Total rows/records %v", deletedRows)
 
@@ -146,15 +148,16 @@ func DeleteStock(w http.ResponseWriter, r *http.Request){
 }
 
 
-func insertStock(stock models.Stock) int64{
-	db:= createConnection()
-	defer db.Close()
-
-	sqlStatement :=`INSERT INTO stocks (name, price, company) VALUES ($1,$2,$3) RETURNING stockid` //stocks -> name of a table in your PostgreSQL database stocksdb.
+func insertStock(stock models.Stock) (int64, error){
+	sqlStatement :=`
+		INSERT INTO stocks (name, price, company) 
+		VALUES ($1,$2,$3) 
+		RETURNING stockid
+	` //stocks -> name of a table in your PostgreSQL database stocksdb.
 	// Note: the “RETURNING stockid” clause is required here—without it, there’s no value for row.Scan(&id) to read
 	var id int64
 
-	row := db.QueryRow(sqlStatement, stock.Name, stock.Price, stock.Company)	
+	row := database.DB.QueryRow(sqlStatement, stock.Name, stock.Price, stock.Company)	
 	//db.QueryRow(...) executes the INSERT … RETURNING statement.
 		//It substitutes:
 		//	$1 → stock.Name
@@ -166,40 +169,25 @@ func insertStock(stock models.Stock) int64{
 	}
 
 	fmt.Printf("Inserted a single record %v", id)
-	return id
+	return id,nil
 }
 
 func getStock(id int64)(models.Stock,error){  //getStock dont return array as in getAllStocks, no need of [].
-	db:= createConnection()
-	defer db.Close()
-
 	var stock models.Stock
 
 	sqlStatement := `SELECT * FROM stocks WHERE stockid=$1`	//No RETURNING is involved—SELECT by its very nature returns rows, and Scan simply reads those returned columns.
 
-	row := db.QueryRow(sqlStatement, id)
+	row := database.DB.QueryRow(sqlStatement, id)
 	err := row.Scan(&stock.StockID, &stock.Name, &stock.Price, &stock.Company)
 
-	switch err {
-	case sql.ErrNoRows:
-		fmt.Println("No rows were returned!")
-		return stock, nil
-	case nil:
-		return stock, nil
-	default: 
-		log.Fatalf("Unable to scan the row. %v", err)
-	}
 	return stock, err
 }
 
 func getAllStocks() ([]models.Stock, error){
-	db:=  createConnection()
-	defer db.Close()
-
 	var stocks []models.Stock
 	sqlStatement := `SELECT * FROM stocks`
 
-	rows, err:= db.Query(sqlStatement)
+	rows, err:= database.DB.Query(sqlStatement)
 	if err!= nil{
 		log.Fatalf("Unable to execute the query. %v", err)
 	}
@@ -209,49 +197,51 @@ func getAllStocks() ([]models.Stock, error){
 		var stock models.Stock
 		err := rows.Scan(&stock.StockID, &stock.Name, &stock.Price, &stock.Company)
 		if err!= nil{
-			log.Fatalf("Unable to scan the row. %v", err)
+			return nil, fmt.Errorf("scan row: %w", err)
 		}
 
 		stocks = append(stocks, stock)
 	}
-	return stocks, err
+	return stocks, nil
 }
 
-func updateStock(id int64, stock models.Stock) int64{
-	db := createConnection()
-	defer db.Close()
-
-	sqlStatement  := `UPDATE stocks SET name=$2, price=$3, company=$4 WHERE stockid=$1`
-
-	res, err:= db.Exec(sqlStatement, id, stock.Name, stock.Price, stock.Company)
+func updateStock(id int64, stock models.Stock) (int64,error){
+	// sqlStatement  := `UPDATE stocks SET name=$2, price=$3, company=$4 WHERE stockid=$1`
+	sqlStatement := `
+		UPDATE stocks
+		SET
+			name = COALESCE(NULLIF($2,''), name),
+			price = CASE WHEN $3 = 0 THEN price ELSE $3 END,
+			company = COALESCE(NULLIF($4,''),company)
+		WHERE stockid = $1
+	`			
+	res, err:= database.DB.Exec(sqlStatement, id, stock.Name, stock.Price, stock.Company)
 	if err!=nil{
-		log.Fatalf("Unable to execute the query. %v", err)
+		return 0, fmt.Errorf("execute update: %w", err)
 	}
 
 	rowAffected,err := res.RowsAffected()
 	if err!= nil{
-		log.Fatalf("Error while checking the affected rows. %v", err)
+		return 0, fmt.Errorf("rows affected: %w", err)
 	}
 	fmt.Printf("Total row/records affected %v", rowAffected)
-	return rowAffected
+	return rowAffected, nil
 }
 
-func deleteStock(id int64) int64{
-	db := createConnection()
-	defer db.Close()
+func deleteStock(id int64) (int64, error){
 
 	sqlStatement := `DELETE FROM stocks WHERE stockid=$1`
 
-	res, err := db.Exec(sqlStatement, id)
+	res, err := database.DB.Exec(sqlStatement, id)
 	if err != nil{ 
-		log.Fatalf("Unable to execute the query, %v", err)
+		return 0, fmt.Errorf("execute delete: %w", err)
 	}
 
 	rowsAffected , err := res.RowsAffected()
 	if err!=nil{
-		log.Fatalf("Error while checking affected rows. %v", err)
+		return 0, fmt.Errorf("rows affected: %w", err)
 	}
 
-	fmt.Printf("Total rows/records affected. %v \n",rowsAffected)
-	return rowsAffected
+	fmt.Printf("Total rows/records affected: %v \n",rowsAffected)
+	return rowsAffected, nil
 }
